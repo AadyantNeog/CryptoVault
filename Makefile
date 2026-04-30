@@ -8,16 +8,20 @@ CLIENT_SRCS = src/client/client_main.c src/client/client.c
 
 SERVER_BIN = build/vault_server
 CLIENT_BIN = build/vault_client
+BUILD_DIR = build
 
 .PHONY: all clean
 
 all: $(SERVER_BIN) $(CLIENT_BIN)
 
-$(SERVER_BIN): $(COMMON_SRCS) $(SERVER_SRCS)
+$(SERVER_BIN): $(COMMON_SRCS) $(SERVER_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ $(COMMON_SRCS) $(SERVER_SRCS) $(LDFLAGS)
 
-$(CLIENT_BIN): $(COMMON_SRCS) $(CLIENT_SRCS)
+$(CLIENT_BIN): $(COMMON_SRCS) $(CLIENT_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ $(COMMON_SRCS) $(CLIENT_SRCS) $(LDFLAGS)
 
+$(BUILD_DIR):
+	mkdir -p $@
+
 clean:
-	rm -f $(SERVER_BIN) $(CLIENT_BIN)
+	rm -rf $(BUILD_DIR)
