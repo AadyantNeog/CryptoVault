@@ -1,0 +1,829 @@
+CryptoVault Viva Reference
+==========================
+
+1. Big Picture
+---------------
+CryptoVault is a client-server encrypted vault written in C for Linux.
+
+System flow:
+1. The server starts and creates the storage area if needed.
+2. The server opens a TCP socket and waits for clients.
+3. Each client connects and gets its own thread.
+4. A client logs in with a username and password.
+5. The server checks the role and permissions for every command.
+6. For uploads, the client encrypts the file first and sends encrypted bytes.
+7. The server stores encrypted bytes in storage/blobs/ and metadata in files.db.
+8. For downloads, the server sends encrypted bytes back and the client decrypts them.
+
+The project demonstrates:
+- sockets
+- threads
+- mutexes
+- semaphores
+- file locking
+- shared memory
+- pipes
+- signals
+- role-based authorization
+
+
+2. Folder-by-Folder Explanation
+-------------------------------
+
+2.1 build/
+This folder contains the compiled executables after running make.
+
+Files:
+- vault_server
+  The compiled server program.
+- vault_client
+  The compiled client program.
+
+2.2 docs/
+This folder contains written project documentation.
+
+Files:
+- FEATURES_AND_USAGE.md
+  Main user/project documentation. Explains features, architecture, build steps, usage, and OS requirement mapping.
+- VIVA_REFERENCE.txt
+  This file. It explains every folder, file, and important function for viva preparation.
+
+2.3 src/
+This is the source code root. It is split into three logical areas:
+- common
+- server
+- client
+
+2.4 src/common/
+Code shared by both the server and the client.
+
+2.5 src/server/
+Server-side logic: authentication, file storage, socket handling, IPC, locking.
+
+2.6 src/client/
+Client-side logic: command-line interface, uploads, downloads, and socket communication.
+
+2.7 storage/
+Persistent runtime data created by the server.
+
+Files/folders inside storage:
+- users.db
+  Stores user accounts in the format:
+  username|role|password_hash
+- files.db
+  Stores file metadata in the format:
+  file_id|owner|blob_filename|remote_name|key_hex|size|timestamp|shared_users
+- blobs/
+  Stores the actual encrypted file contents as random .bin files.
+- audit.log
+  Stores audit events written by the logger child process.
+
+
+3. File-by-File Explanation
+---------------------------
+
+3.1 Makefile
+Purpose:
+- Builds the project.
+- Defines which source files belong to the server and which belong to the client.
+
+Important parts:
+- CC = gcc
+  Chooses the compiler.
+- CFLAGS
+  Enables warnings, C11, POSIX APIs, pthread support, and include paths.
+- SERVER_SRCS / CLIENT_SRCS
+  Lists source files for each executable.
+- all
+  Default target that builds both server and client.
+- clean
+  Deletes compiled binaries.
+
+
+3.2 src/common/common.h
+Purpose:
+- Shared constants, structs, and function declarations.
+
+Important constants:
+- MAX_LINE
+  Maximum size of a protocol line.
+- MAX_NAME
+  Maximum username length.
+- MAX_ROLE
+  Maximum role text length.
+- MAX_SHARED
+  Maximum text size of the comma-separated share list.
+- MAX_PATH_LEN
+  Maximum filesystem path size.
+- MAX_KEY_HEX
+  Maximum encryption key text size.
+- FILE_DB_LINE
+  Maximum length of a metadata line in files.db.
+
+Important structs:
+- VaultFile
+  Represents one file metadata record.
+  Fields:
+  - id: unique file ID shown to users
+  - owner: username of uploader
+  - stored_name: random blob filename on disk
+  - original_name: user-visible remote filename
+  - key_hex: encryption key in hex text
+  - size: file size in bytes
+  - created_at: timestamp
+  - shared_with: comma-separated usernames who can access the file
+
+- VaultStats
+  Shared runtime statistics stored in shared memory.
+  Fields:
+  - active_clients
+  - total_clients_served
+  - total_uploads
+  - total_downloads
+  - total_commands
+
+
+3.3 src/common/common.c
+Purpose:
+- Shared utility functions used by both client and server.
+
+Functions:
+
+send_all(int sockfd, const void *buffer, size_t length)
+- Sends exactly length bytes on a socket.
+- Keeps calling send() until everything is transmitted.
+- Used for binary file transfer and protocol lines.
+
+recv_all(int sockfd, void *buffer, size_t length)
+- Receives exactly length bytes on a socket.
+- Keeps calling recv() until all requested bytes arrive.
+- Used when downloading or uploading raw file bytes.
+
+recv_line(int sockfd, char *buffer, size_t size)
+- Reads a text command/response from a socket until newline.
+- Used for line-based protocol commands like LOGIN, LIST, UPLOAD, QUIT.
+
+send_linef(int sockfd, const char *fmt, ...)
+- Formats a string like printf, appends newline, and sends it.
+- Makes it easy to send responses such as:
+  OK Logged in as alice (user)
+
+trim_newline(char *text)
+- Removes trailing \n or \r characters from input text.
+- Useful after reading from sockets or stdin.
+
+safe_copy(char *dst, size_t dst_size, const char *src)
+- Safe wrapper around snprintf-based string copying.
+- Prevents easy buffer overflow mistakes.
+
+simple_hash_password(const char *username, const char *password, char *out_hex, size_t out_size)
+- Generates a simple hash string from username and password.
+- Used for storing passwords in users.db.
+- This is simplified for education, not production security.
+
+generate_random_hex(char *out_hex, size_t hex_chars)
+- Reads random bytes from /dev/urandom and converts them to hex text.
+- Used for file IDs, blob names, and encryption keys.
+
+split_csv_contains(const char *csv, const char *value)
+- Checks whether a username exists in a comma-separated list.
+- Used for testing whether a file is shared with a user.
+
+append_csv_unique(char *csv, size_t csv_size, const char *value)
+- Adds a username to a comma-separated list only if it is not already present.
+- Used when sharing files.
+
+current_timestamp(char *buffer, size_t size)
+- Converts current time into readable text.
+- Used in audit logging.
+
+
+3.4 src/common/crypto.h
+Purpose:
+- Declares the encryption helper functions.
+
+
+3.5 src/common/crypto.c
+Purpose:
+- Implements the educational encryption mechanism used by the client.
+
+Important note:
+- This is not AES.
+- It is a custom educational XOR stream cipher using a xorshift64-style keystream.
+- It is good for demonstrating encrypted storage workflow, but not for real-world security.
+
+Functions:
+
+hex_value(char ch)
+- Internal helper.
+- Converts one hex character to its numeric value.
+
+key_hex_to_bytes(const char *key_hex, unsigned char *out_bytes, size_t *out_len)
+- Converts a hex text key into raw bytes.
+- Used before generating the keystream state.
+
+crypto_xor_stream(unsigned char *buffer, size_t length, const char *key_hex, uint64_t *state)
+- Core encryption/decryption function.
+- Builds a deterministic stream from the key.
+- XORs the buffer with the keystream.
+- Because XOR stream encryption is symmetric, the same function both encrypts and decrypts.
+
+crypto_generate_key(char *key_hex, size_t size)
+- Generates a random hex key for one uploaded file.
+- Called by the client before upload.
+
+
+3.6 src/server/lock_utils.h
+Purpose:
+- Declares the file locking helpers.
+
+
+3.7 src/server/lock_utils.c
+Purpose:
+- Implements advisory file locking using fcntl().
+
+Functions:
+
+lock_fd(int fd, short lock_type)
+- Applies a blocking lock to a file descriptor.
+- lock_type is usually:
+  - F_RDLCK for read lock
+  - F_WRLCK for write lock
+- Used to protect users.db and files.db.
+
+unlock_fd(int fd)
+- Removes a lock from the file descriptor.
+
+
+3.8 src/server/auth.h
+Purpose:
+- Declares authentication and user management functions.
+
+
+3.9 src/server/auth.c
+Purpose:
+- Handles user accounts, password verification, and role storage.
+
+Functions:
+
+users_path(char *buffer, size_t size, const char *storage_root)
+- Internal helper.
+- Builds the path to users.db.
+
+is_valid_role(const char *role)
+- Internal helper.
+- Checks whether a role is one of:
+  admin, user, guest
+
+auth_init_defaults(const char *storage_root)
+- Creates users.db if it does not exist.
+- Also adds default users:
+  - admin / admin123
+  - alice / alice123
+  - guest / guest123
+
+auth_verify_credentials(const char *storage_root, const char *username, const char *password, char *role_out, size_t role_out_size)
+- Reads users.db.
+- Hashes the provided password.
+- Compares it with stored records.
+- If a match is found, returns the user role.
+
+auth_user_exists(const char *storage_root, const char *username)
+- Checks whether a username already exists.
+- Used before creating users and before sharing files.
+
+auth_create_user(const char *storage_root, const char *username, const char *password, const char *role)
+- Appends a new user to users.db.
+- Uses a write lock before modifying the file.
+- Used by admins through the CREATE_USER command.
+
+
+3.10 src/server/storage.h
+Purpose:
+- Declares the metadata and blob storage functions.
+
+
+3.11 src/server/storage.c
+Purpose:
+- Manages files.db and the logical file ownership/sharing rules.
+- This file is central for data consistency and file locking.
+
+Functions:
+
+files_path(char *buffer, size_t size, const char *storage_root)
+- Internal helper.
+- Builds the path to files.db.
+
+storage_build_blob_path(const char *storage_root, const char *stored_name, char *buffer, size_t size)
+- Builds a full path to a blob file in storage/blobs/.
+
+parse_file_line(const char *line, VaultFile *file)
+- Internal helper.
+- Parses one metadata line from files.db into a VaultFile struct.
+
+write_file_record(FILE *fp, const VaultFile *file)
+- Internal helper.
+- Writes a VaultFile struct back into the metadata text format.
+
+storage_init(const char *storage_root)
+- Creates storage folders and files if they do not exist.
+- Creates storage/blobs/.
+- Creates files.db if needed.
+- Also ensures default users are created through auth_init_defaults().
+
+storage_add_file(const char *storage_root, const VaultFile *file)
+- Appends a new metadata record to files.db.
+- Uses a write lock to prevent concurrent corruption.
+- Called after the server successfully receives an uploaded blob.
+
+storage_get_file(const char *storage_root, const char *file_id, VaultFile *out_file)
+- Reads files.db under a read lock.
+- Finds a file record by file ID.
+- Used by download, delete, and share paths.
+
+storage_has_access(const VaultFile *file, const char *username, const char *role)
+- Decides whether a user may access a file.
+- Access rules:
+  - admin can access everything
+  - owner can access own file
+  - shared users can access shared files
+
+storage_list_accessible(const char *storage_root, const char *username, const char *role, char *buffer, size_t size)
+- Reads all file records.
+- Filters only those the current user may access.
+- Builds the text returned by the LIST command.
+
+rewrite_db_with_update(...)
+- Internal helper used for safe metadata updates.
+- Opens files.db with a write lock.
+- Reads old records.
+- Writes updated results into files.db.tmp.
+- Renames the temp file to files.db.
+- This pattern helps avoid corruption and lost updates.
+
+share_updater(VaultFile *file, void *ctx)
+- Internal helper used by rewrite_db_with_update().
+- Adds a target username to shared_with if the requester is allowed.
+
+storage_share_file(const char *storage_root, const char *file_id, const char *requester, const char *role, const char *target_user)
+- Shares a file with another user.
+- First checks that the target user exists.
+- Then updates files.db using the safe rewrite path.
+
+delete_updater(VaultFile *file, void *ctx)
+- Internal helper used by rewrite_db_with_update().
+- Deletes the actual blob file from storage/blobs/.
+- Skips writing the deleted metadata record back into files.db.
+
+storage_delete_file(const char *storage_root, const char *file_id, const char *requester, const char *role)
+- Deletes a file if the requester is the owner or admin.
+- Removes both:
+  - the metadata record
+  - the blob file on disk
+
+
+3.12 src/server/ipc.h
+Purpose:
+- Declares the IPC state structure and helper functions.
+
+Important struct:
+- ServerIpc
+  Holds:
+  - log_pipe: pipe for sending log messages to child logger
+  - logger_pid: pid of logger process
+  - shm_fd: shared memory file descriptor
+  - shm_name: shared memory object name
+  - stats: pointer to mapped shared memory
+  - stats_mutex: mutex protecting stat updates
+  - transfer_slots: semaphore controlling concurrent transfers
+  - audit_log_path: log file location
+
+
+3.13 src/server/ipc.c
+Purpose:
+- Implements IPC features required by the assignment.
+
+Functions:
+
+logger_process(int read_fd, const char *audit_log_path)
+- Child process function.
+- Waits on the read end of the pipe.
+- Writes incoming log messages into audit.log.
+
+ipc_init(ServerIpc *ipc, const char *storage_root)
+- Initializes all IPC resources:
+  - creates a pipe
+  - forks a logger child process
+  - creates shared memory for stats
+  - initializes mutex and semaphore
+
+ipc_cleanup(ServerIpc *ipc)
+- Frees IPC resources during shutdown:
+  - closes pipe
+  - waits for logger child
+  - unmaps and unlinks shared memory
+  - destroys mutex and semaphore
+
+ipc_log(ServerIpc *ipc, const char *message)
+- Sends a raw log message through the pipe.
+
+ipc_logf(ServerIpc *ipc, const char *fmt, ...)
+- Formats a timestamped log line and sends it through the pipe.
+- Used for audit events like login, upload, download, delete.
+
+increment_field(ServerIpc *ipc, int *field, int delta)
+- Internal helper.
+- Updates one shared statistic under the mutex.
+
+ipc_adjust_active_clients(ServerIpc *ipc, int delta)
+- Increases or decreases the active client count.
+
+ipc_increment_total_clients(ServerIpc *ipc)
+- Increments the number of clients ever served.
+
+ipc_increment_uploads(ServerIpc *ipc)
+- Increments upload count.
+
+ipc_increment_downloads(ServerIpc *ipc)
+- Increments download count.
+
+ipc_increment_commands(ServerIpc *ipc)
+- Increments the number of protocol commands handled.
+
+ipc_format_stats(ServerIpc *ipc, char *buffer, size_t size)
+- Reads the shared statistics and formats them as text.
+- Used when admin requests STATS.
+
+
+3.14 src/server/server.h
+Purpose:
+- Declares the main server context and the server_run() function.
+
+Important struct:
+- ServerContext
+  Holds:
+  - listen_fd: listening socket
+  - stop_flag: signal-controlled shutdown flag
+  - storage_root: root storage directory
+  - ipc: IPC state bundle
+
+
+3.15 src/server/server.c
+Purpose:
+- Main server runtime logic.
+- Accepts clients, creates threads, parses commands, enforces authorization, and coordinates uploads/downloads.
+
+Important local struct:
+- ClientSession
+  Holds per-client session state:
+  - sockfd
+  - server context pointer
+  - authenticated flag
+  - username
+  - role
+
+Functions:
+
+can_upload(const ClientSession *session)
+- Checks whether the current role is allowed to upload.
+- admin and user can upload
+- guest cannot upload
+
+save_upload_blob(int sockfd, const char *path, long size)
+- Receives raw encrypted file bytes from the client.
+- Writes them to the blob file in storage/blobs/.
+- Called after the UPLOAD command is accepted.
+
+stream_download_blob(int sockfd, const char *path, long size)
+- Reads encrypted blob bytes from disk and sends them to the client.
+
+handle_upload(ClientSession *session, char *remote_name, char *size_text, char *key_hex)
+- Handles the UPLOAD command.
+- Steps:
+  1. Checks login and role.
+  2. Validates parameters.
+  3. Creates file ID and random blob filename.
+  4. Sends READY to the client.
+  5. Waits for encrypted bytes.
+  6. Stores the blob.
+  7. Writes metadata into files.db.
+  8. Updates stats and log.
+
+handle_download(ClientSession *session, char *file_id)
+- Handles the DOWNLOAD command.
+- Steps:
+  1. Checks login.
+  2. Looks up file metadata.
+  3. Checks access rights.
+  4. Sends file name, size, and key metadata to the client.
+  5. Waits for READY.
+  6. Streams encrypted blob bytes to the client.
+  7. Updates stats and log.
+
+handle_list(ClientSession *session)
+- Handles LIST.
+- Returns all files the current user may access.
+
+handle_create_user(ClientSession *session, char *username, char *password, char *role)
+- Handles CREATE_USER.
+- Only admins are allowed.
+
+handle_share(ClientSession *session, char *file_id, char *target_user)
+- Handles SHARE.
+- Guests are denied.
+- Owners or admin may share a file.
+
+handle_delete(ClientSession *session, char *file_id)
+- Handles DELETE.
+- Owner or admin may delete a file.
+
+handle_stats(ClientSession *session)
+- Handles STATS.
+- Only admins may view shared-memory statistics.
+
+client_thread(void *arg)
+- One thread per connected client.
+- Sends greeting.
+- Repeatedly reads commands from the client socket.
+- Parses each command and dispatches to the right handler.
+- Tracks session login state.
+- Updates command counters.
+- Cleans up when the client disconnects.
+
+server_run(ServerContext *ctx, int port)
+- Creates the listening TCP socket.
+- Binds and listens on the selected port.
+- Accepts new clients in a loop.
+- Allocates a ClientSession per client.
+- Starts a detached thread for each client.
+
+
+3.16 src/server/server_main.c
+Purpose:
+- The server entry point.
+
+Functions:
+
+on_signal(int signum)
+- Signal handler for SIGINT and SIGTERM.
+- Sets a stop flag so the server can shut down gracefully.
+
+main(int argc, char **argv)
+- Starts the whole server.
+- Steps:
+  1. Reads port from command line or uses default 9090.
+  2. Installs signal handlers.
+  3. Initializes storage.
+  4. Initializes IPC.
+  5. Calls server_run().
+  6. Cleans up IPC on exit.
+
+
+3.17 src/client/client.h
+Purpose:
+- Declares the client_run() function.
+
+
+3.18 src/client/client.c
+Purpose:
+- Implements the interactive client program.
+- The client is responsible for:
+  - connecting to the server
+  - reading user commands
+  - encrypting data before upload
+  - decrypting data after download
+
+Functions:
+
+handle_upload_command(int sockfd, char *args)
+- Handles the local client command:
+  upload <local_path> <remote_name>
+- Steps:
+  1. Opens the local file.
+  2. Reads its size.
+  3. Generates a random encryption key.
+  4. Sends UPLOAD command to server with name, size, and key.
+  5. Waits for READY.
+  6. Reads local file chunks.
+  7. Encrypts each chunk with crypto_xor_stream().
+  8. Sends encrypted bytes to server.
+
+handle_download_command(int sockfd, char *args)
+- Handles the local client command:
+  download <file_id> <output_path>
+- Steps:
+  1. Sends DOWNLOAD command.
+  2. Receives file metadata.
+  3. Opens output file.
+  4. Sends READY.
+  5. Receives encrypted bytes.
+  6. Decrypts them using the same crypto_xor_stream().
+  7. Writes plaintext to the local output file.
+
+print_block_response(int sockfd, const char *end_token)
+- Utility for commands that return multi-line output.
+- Used for LIST and STATS.
+
+client_run(const char *host, int port)
+- Main client runtime loop.
+- Steps:
+  1. Creates a socket.
+  2. Connects to the server.
+  3. Prints the server greeting.
+  4. Reads commands from the user.
+  5. Maps local commands like login, upload, list, share, delete, quit to server protocol commands.
+  6. Calls upload/download helpers when file transfer is needed.
+
+
+3.19 src/client/client_main.c
+Purpose:
+- Client entry point.
+
+Function:
+
+main(int argc, char **argv)
+- Reads optional host and port from command line.
+- Defaults to 127.0.0.1 and 9090.
+- Calls client_run().
+
+
+4. Runtime Files and What They Mean
+-----------------------------------
+
+4.1 storage/users.db
+Each line is one user:
+username|role|password_hash
+
+Example meaning:
+- alice|user|...
+  alice is a normal user.
+
+4.2 storage/files.db
+Each line is one file:
+file_id|owner|blob_filename|remote_name|key_hex|size|timestamp|shared_users
+
+Meaning of fields:
+- file_id
+  Unique ID used in commands like download/delete/share.
+- owner
+  User who uploaded the file.
+- blob_filename
+  Random filename in storage/blobs/.
+- remote_name
+  User-visible logical name.
+- key_hex
+  Encryption key text.
+- size
+  Blob size in bytes.
+- timestamp
+  Upload time.
+- shared_users
+  Comma-separated usernames with shared access.
+
+4.3 storage/blobs/
+Contains encrypted binary file contents.
+Why random names are used:
+- separates logical filenames from actual stored files
+- reduces naming collisions
+- makes storage layout cleaner
+
+4.4 storage/audit.log
+Contains timestamped activity records such as:
+- server startup
+- login success/failure
+- upload
+- download
+- share
+- delete
+
+
+5. Main Execution Flow for Viva
+-------------------------------
+
+5.1 Server startup flow
+1. server_main.c -> main()
+2. storage_init() creates storage if missing
+3. auth_init_defaults() creates default users if needed
+4. ipc_init() creates pipe, logger process, shared memory, mutex, semaphore
+5. server_run() opens the listening socket
+6. Server waits in accept()
+
+5.2 Client login flow
+1. client_main.c -> main()
+2. client_run() connects to server
+3. User types:
+   login alice alice123
+4. Client sends:
+   LOGIN alice alice123
+5. Server client_thread() receives it
+6. auth_verify_credentials() checks users.db
+7. Server stores username and role in ClientSession
+8. Server replies with success or failure
+
+5.3 Upload flow
+1. User types:
+   upload sample.txt notes
+2. Client opens sample.txt and gets size
+3. Client generates a random key
+4. Client sends:
+   UPLOAD notes <size> <key_hex>
+5. Server handle_upload() creates:
+   - file ID
+   - random blob filename
+6. Server replies READY
+7. Client reads local bytes, encrypts them, sends encrypted chunks
+8. Server save_upload_blob() writes encrypted bytes into storage/blobs/
+9. Server storage_add_file() appends metadata to files.db
+10. Server updates stats and audit log
+
+5.4 Download flow
+1. User types:
+   download <file_id> output.txt
+2. Client sends DOWNLOAD <file_id>
+3. Server storage_get_file() finds metadata
+4. Server storage_has_access() checks permissions
+5. Server sends file info and key
+6. Client sends READY
+7. Server stream_download_blob() sends encrypted bytes
+8. Client decrypts bytes and writes plaintext to output.txt
+
+5.5 Share flow
+1. User types:
+   share <file_id> guest
+2. Server checks requester role and ownership
+3. storage_share_file() safely rewrites files.db
+4. The target user can now see the file in LIST
+
+5.6 Delete flow
+1. User types:
+   delete <file_id>
+2. Server checks ownership/admin role
+3. storage_delete_file() safely rewrites files.db
+4. delete_updater() removes the blob from storage/blobs/
+
+
+6. Where Each OS Concept Appears
+--------------------------------
+
+Role-based authorization:
+- auth.c
+- server.c
+
+File locking:
+- lock_utils.c
+- auth.c
+- storage.c
+
+Concurrency control:
+- server.c with pthread threads
+- ipc.c with mutex and semaphore
+
+Data consistency:
+- storage.c write-locked metadata updates
+- temp-file rewrite and rename pattern
+
+Socket programming:
+- server.c
+- client.c
+
+IPC:
+- ipc.c
+- pipe for logger
+- shared memory for stats
+- signals in server_main.c
+
+
+7. Good Viva One-Liners
+-----------------------
+
+Why blobs and files.db are separate?
+- Metadata and file contents are separated so access control and sharing can be managed safely without mixing them into raw file storage.
+
+Why use random blob filenames?
+- It avoids name collisions and decouples user-visible names from physical stored files.
+
+Why use fcntl locks?
+- Because multiple client threads may access the same metadata files at the same time, and fcntl advisory locks prevent corruption.
+
+Why use a semaphore if threads already exist?
+- Threads provide concurrency, while the semaphore limits how many expensive transfers happen at once.
+
+Why use shared memory for stats?
+- It demonstrates IPC for live shared state across processes and is efficient for counters.
+
+Why use a logger child process and pipe?
+- It is a clear IPC demonstration where the server sends audit messages to another process asynchronously.
+
+Why is the encryption called educational?
+- Because it uses a custom XOR stream cipher for self-contained lab use instead of a vetted algorithm like AES-GCM.
+
+
+8. Important Limitations You Can Admit Honestly
+-----------------------------------------------
+- The encryption is not production-grade.
+- Password hashing is simplified.
+- Filenames with spaces are not handled well by the simple command parser.
+- Transport is plain TCP, not TLS.
+
+These are acceptable to say in viva if you immediately add:
+"I kept these simplified so the Operating Systems concepts remain the main focus and are clearly visible in the implementation."
